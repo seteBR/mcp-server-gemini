@@ -1,17 +1,22 @@
-import { ServerCapabilities, ServerInfo, InitializeResult } from './types';
+import { ServerCapabilities, ServerInfo, InitializeResult, ProgressParams } from './types';
 
 export const PROTOCOL_VERSION = '2024-11-05';
 
+// Standard JSON-RPC error codes
 export const ERROR_CODES = {
-  PARSE_ERROR: -32700,        // Invalid JSON received
-  INVALID_REQUEST: -32600,    // JSON not a valid request object
-  METHOD_NOT_FOUND: -32601,   // Method does not exist
-  INVALID_PARAMS: -32602,     // Invalid method parameters
-  INTERNAL_ERROR: -32603,     // Internal JSON-RPC error
-  SERVER_ERROR_START: -32099, // Server error start
-  SERVER_ERROR_END: -32000,   // Server error end
-  SERVER_NOT_INITIALIZED: -32002,  // Server not initialized
-  UNKNOWN_ERROR: -32001       // Unknown error
+  PARSE_ERROR: -32700,
+  INVALID_REQUEST: -32600,
+  METHOD_NOT_FOUND: -32601,
+  INVALID_PARAMS: -32602,
+  INTERNAL_ERROR: -32603,
+  SERVER_NOT_INITIALIZED: -32002,
+  UNKNOWN_ERROR: -32001,
+  
+  // Custom error codes for Gemini
+  GEMINI_API_ERROR: -32100,
+  GEMINI_RATE_LIMIT: -32101,
+  GEMINI_INVALID_TOKEN: -32102,
+  GEMINI_CONTENT_FILTER: -32103
 } as const;
 
 export const SERVER_INFO: ServerInfo = {
@@ -21,22 +26,56 @@ export const SERVER_INFO: ServerInfo = {
 
 export const SERVER_CAPABILITIES: ServerCapabilities = {
   experimental: {},
-  prompts: {
-    listChanged: true
-  },
-  resources: {
-    subscribe: true,
-    listChanged: true
-  },
-  tools: {
-    listChanged: true
-  }
+  prompts: { listChanged: true },
+  resources: { subscribe: true, listChanged: true },
+  tools: { listChanged: true },
+  logging: {}
 };
 
-export function createInitializeResult(): InitializeResult {
-  return {
-    protocolVersion: PROTOCOL_VERSION,
-    serverInfo: SERVER_INFO,
-    capabilities: SERVER_CAPABILITIES
-  };
+export class ProtocolManager {
+  private initialized = false;
+  private shutdownRequested = false;
+
+  constructor() {}
+
+  isInitialized(): boolean {
+    return this.initialized;
+  }
+
+  markAsInitialized(): void {
+    this.initialized = true;
+  }
+
+  requestShutdown(): void {
+    this.shutdownRequested = true;
+  }
+
+  isShutdownRequested(): boolean {
+    return this.shutdownRequested;
+  }
+
+  createInitializeResult(): InitializeResult {
+    return {
+      protocolVersion: PROTOCOL_VERSION,
+      serverInfo: SERVER_INFO,
+      capabilities: SERVER_CAPABILITIES
+    };
+  }
+
+  createProgressNotification(token: string | number, progress: number, total?: number): ProgressParams {
+    return {
+      progressToken: token,
+      progress,
+      total
+    };
+  }
+
+  validateState(method: string): void {
+    if (method !== 'initialize' && !this.initialized) {
+      throw new Error('Server not initialized');
+    }
+    if (this.shutdownRequested && method !== 'exit') {
+      throw new Error('Server is shutting down');
+    }
+  }
 }

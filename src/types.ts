@@ -1,64 +1,35 @@
-export interface ServerCapabilities {
-  experimental?: Record<string, any>;
-  prompts?: {
-    listChanged?: boolean;
-  };
-  resources?: {
-    subscribe?: boolean;
-    listChanged?: boolean;
-  };
-  tools?: {
-    listChanged?: boolean;
-  };
+// Existing interfaces...
+
+export interface ProgressParams {
+  progressToken: string | number;
+  progress: number;
+  total?: number;
 }
 
-export interface ServerInfo {
-  name: string;
-  version: string;
-}
-
-export interface InitializeResult {
-  protocolVersion: string;
-  serverInfo: ServerInfo;
-  capabilities: ServerCapabilities;
-}
-
-export interface MCPRequest {
+export interface NotificationMessage {
   jsonrpc: '2.0';
-  id: number | string;
   method: string;
   params?: any;
 }
 
-export interface MCPResponse {
-  jsonrpc: '2.0';
-  id: number | string;
-  result?: any;
-  error?: {
+export interface ErrorNotification extends NotificationMessage {
+  method: 'notifications/error';
+  params: {
     code: number;
     message: string;
     data?: any;
   };
 }
 
-export interface GenerateRequest extends MCPRequest {
-  params: {
-    prompt: string;
-    temperature?: number;
-    maxTokens?: number;
-    stream?: boolean;
-  };
+export interface ProgressNotification extends NotificationMessage {
+  method: 'notifications/progress';
+  params: ProgressParams;
 }
 
-export interface GenerateResponse extends MCPResponse {
-  result: {
-    type: 'completion';
-    content: string;
-    metadata: {
-      model: string;
-      provider: string;
-      temperature?: number;
-      maxTokens?: number;
-    };
-  };
+export interface ShutdownRequest extends MCPRequest {
+  method: 'shutdown';
+}
+
+export interface ExitNotification extends NotificationMessage {
+  method: 'exit';
 }
