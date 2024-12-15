@@ -20,6 +20,11 @@ interface MCPResponse {
   };
 }
 
+type MCPError = {
+  code: number;
+  message: string;
+};
+
 class MCPServer {
   private wss: WebSocketServer;
   private model: any;
@@ -46,7 +51,7 @@ class MCPServer {
     }
   }
 
-  private handleConnection(ws: WebSocket) {
+  private async handleConnection(ws: WebSocket) {
     this.log('New client connected');
 
     ws.on('message', async (data: WebSocket.RawData) => {
@@ -54,19 +59,26 @@ class MCPServer {
         const message = data.toString();
         this.log('Received message:', message);
 
-        const request: MCPRequest = JSON.parse(message);
-        const response = await this.handleRequest(request);
-        
+        let parsedRequest: MCPRequest;
+        try {
+          parsedRequest = JSON.parse(message);
+        } catch (parseError) {
+          this.sendError(ws, null, -32700, 'Parse error');
+          return;
+        }
+
+        const response = await this.handleRequest(parsedRequest);
         this.log('Sending response:', response);
         ws.send(JSON.stringify(response));
       } catch (error) {
-        this.log('Error handling message:', error);
-        ws.send(JSON.stringify(this.createErrorResponse(null, -32603, 'Internal error')));
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        this.log('Error handling message:', errorMessage);
+        this.sendError(ws, null, -32603, 'Internal error');
       }
     });
 
-    ws.on('error', (error) => {
-      this.log('WebSocket error:', error);
+    ws.on('error', (error: Error) => {
+      this.log('WebSocket error:', error.message);
     });
 
     ws.on('close', () => {
@@ -130,17 +142,18 @@ class MCPServer {
         }
       };
     } catch (error) {
-      this.log('Gemini API error:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.log('Gemini API error:', errorMessage);
       return this.createErrorResponse(
         request.id,
         -32603,
-        `Gemini API error: ${error.message || 'Unknown error'}`
+        `Gemini API error: ${errorMessage}`
       );
     }
   }
 
   private handleServerError(error: Error) {
-    this.log('Server error:', error);
+    this.log('Server error:', error.message);
   }
 
   private createErrorResponse(id: number | string | null, code: number, message: string): MCPResponse {
@@ -152,6 +165,11 @@ class MCPServer {
         message
       }
     };
+  }
+
+  private sendError(ws: WebSocket, id: number | string | null, code: number, message: string) {
+    const errorResponse = this.createErrorResponse(id, code, message);
+    ws.send(JSON.stringify(errorResponse));
   }
 }
 
