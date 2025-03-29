@@ -35,7 +35,7 @@ class MCPServer {
     
     // Initialize Gemini
     const genAI = new GoogleGenerativeAI(apiKey);
-    this.model = genAI.getGenerativeModel({ model: 'gemini-pro' });
+    this.model = genAI.getGenerativeModel({ model: 'gemini-2.5-pro-exp-03-25' });
 
     // Initialize WebSocket server
     this.wss = new WebSocketServer({ port });
