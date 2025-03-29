@@ -16,7 +16,7 @@ export class MCPServer {
 
   constructor(apiKey: string, port: number = 3005) {
     const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: 'gemini-pro' });
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-pro-exp-03-25' });
 
     this.protocol = new ProtocolManager();
     this.handlers = new MCPHandlers(model, this.protocol);
