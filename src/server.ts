@@ -25,7 +25,7 @@ export class MCPServer {
 
     const genAI = new GoogleGenerativeAI(apiKey);
     // Consider making the model configurable via env var or config file
-    const model = genAI.getGenerativeModel({ model: 'gemini-pro' }); // Use a stable model like gemini-pro
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-pro-exp-03-25' }); // Use a stable model 
 
     this.protocol = new ProtocolManager();
     this.handlers = new MCPHandlers(model, this.protocol, this.debug);
