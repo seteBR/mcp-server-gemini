@@ -1,4 +1,4 @@
-import { ServerCapabilities, ServerInfo, InitializeResult, ProgressParams } from './types';
+import { ServerCapabilities, ServerInfo, InitializeResult, ProgressParams } from './types.js'; // Added .js
 
 export const PROTOCOL_VERSION = '2024-11-05';
 
@@ -11,7 +11,7 @@ export const ERROR_CODES = {
   INTERNAL_ERROR: -32603,
   SERVER_NOT_INITIALIZED: -32002,
   UNKNOWN_ERROR: -32001,
-  
+
   // Custom error codes for Gemini
   GEMINI_API_ERROR: -32100,
   GEMINI_RATE_LIMIT: -32101,
@@ -21,7 +21,7 @@ export const ERROR_CODES = {
 
 export const SERVER_INFO: ServerInfo = {
   name: 'gemini-mcp',
-  version: '1.0.0'
+  version: '1.0.0' // Consider reading from package.json
 };
 
 export const SERVER_CAPABILITIES: ServerCapabilities = {
@@ -32,11 +32,27 @@ export const SERVER_CAPABILITIES: ServerCapabilities = {
   logging: {}
 };
 
+export function createInitializeResult(): InitializeResult {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    serverInfo: SERVER_INFO,
+    capabilities: SERVER_CAPABILITIES
+  };
+}
+
+// Helper to validate required parameters
+export function validateRequest(request: any, requiredParams: string[]): boolean {
+  if (!request.params) {
+    return false;
+  }
+  return requiredParams.every(param => param in request.params);
+}
+
 export class ProtocolManager {
   private initialized = false;
   private shutdownRequested = false;
 
-  constructor() {}
+  constructor() { }
 
   isInitialized(): boolean {
     return this.initialized;
@@ -62,20 +78,26 @@ export class ProtocolManager {
     };
   }
 
-  createProgressNotification(token: string | number, progress: number, total?: number): ProgressParams {
+  createProgressNotification(token: string | number, progress: number, total?: number, message?: string): ProgressParams {
     return {
       progressToken: token,
       progress,
-      total
+      total,
+      message
     };
   }
 
   validateState(method: string): void {
     if (method !== 'initialize' && !this.initialized) {
-      throw new Error('Server not initialized');
+      // Throw a specific error object that can be caught later
+      const error: any = new Error('Server not initialized');
+      error.code = ERROR_CODES.SERVER_NOT_INITIALIZED;
+      throw error;
     }
     if (this.shutdownRequested && method !== 'exit') {
-      throw new Error('Server is shutting down');
+      const error: any = new Error('Server is shutting down');
+      error.code = ERROR_CODES.INVALID_REQUEST; // Or a custom code
+      throw error;
     }
   }
 }
