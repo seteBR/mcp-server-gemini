@@ -1,3 +1,8 @@
+this.httpServer.listen(port, () => {
+  console.log(`MCP Server listening on port ${port}`); // <--- This one
+  this.log(`Health check available at http://localhost:${port}/health`); // <--- This one uses this.log, which is debug-gated
+});
+
 import WebSocket, { WebSocketServer } from 'ws'; // Import WebSocketServer
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { MCPHandlers } from './handlers.js'; // Added .js
@@ -16,7 +21,7 @@ export class MCPServer {
 
   constructor(apiKey: string, port: number = 3005) {
     this.debug = process.env.DEBUG === 'true';
-    this.log(`Starting Gemini MCP Server... Debug: ${this.debug}`);
+    this.log(`Starting Gemini MCP Server... Debug: ${this.debug}`); // Log uses console.error if debug is true
 
     if (!apiKey) {
       console.error('FATAL: GEMINI_API_KEY is missing.');
@@ -24,8 +29,11 @@ export class MCPServer {
     }
 
     const genAI = new GoogleGenerativeAI(apiKey);
-    // Consider making the model configurable via env var or config file
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-pro-exp-03-25' }); // Use a stable model 
+    // Use a stable, generally available model like gemini-pro
+    // const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-latest' }); // Example: Use 1.5 Flash
+    // Or keep gemini-pro if 1.5 isn't needed or causes issues
+    const model = genAI.getGenerativeModel({ model: 'gemini-pro' });
+
 
     this.protocol = new ProtocolManager();
     this.handlers = new MCPHandlers(model, this.protocol, this.debug);
@@ -34,13 +42,34 @@ export class MCPServer {
 
     // Listen for responses from handlers (especially for streaming)
     this.handlers.on('response', (response: MCPResponse) => {
-      const client = this.findClientById(response.id);
-      if (client) {
-        this.sendMessage(client, response);
+      // Find the client associated with this response ID
+      let targetClient: WebSocket | null = null;
+      for (const [client, state] of this.clients.entries()) {
+        // Check if the client has this request ID active
+        // This is crucial for routing stream chunks back correctly
+        if (state.activeRequests.has(response.id)) {
+          targetClient = client;
+          break;
+        }
+      }
+
+      if (targetClient) {
+        this.sendMessage(targetClient, response);
+        // If it's the final stream chunk, remove the ID from active requests
+        if (response.result?.type === 'stream' && response.result?.done) {
+          const state = this.clients.get(targetClient);
+          if (state) {
+            state.activeRequests.delete(response.id);
+            this.log(`Removed completed stream request ID ${response.id} for client ${state.ip}`);
+          }
+        }
       } else {
-        this.log(`Warning: Client not found for response ID ${response.id}`);
+        this.log(`Warning: Client not found for response ID ${response.id}. Could be a completed/cancelled request or final stream chunk.`);
+        // Attempting to find based on ID might fail for the *final* stream chunk if the ID was already removed.
+        // A more robust mapping might be needed if this becomes an issue.
       }
     });
+
 
     this.httpServer = http.createServer(this.handleHttpRequest.bind(this));
     this.wss = new WebSocketServer({ server: this.httpServer }); // Use WebSocketServer
@@ -48,8 +77,11 @@ export class MCPServer {
     this.setupWebSocketServer();
 
     this.httpServer.listen(port, () => {
-      console.log(`MCP Server listening on port ${port}`);
-      this.log(`Health check available at http://localhost:${port}/health`);
+      // Use console.error for server status messages to avoid interfering with stdout capture
+      console.error(`MCP Server listening on port ${port}`);
+      if (this.debug) {
+        console.error(`Health check available at http://localhost:${port}/health`);
+      }
     });
   }
 
@@ -57,24 +89,12 @@ export class MCPServer {
     // Add timestamp to logs
     const timestamp = new Date().toISOString();
     if (this.debug) {
-      console.log(`[MCP Debug ${timestamp}]`, ...args);
+      // Use console.error for debug logs to keep stdout clean for potential IPC
+      console.error(`[MCP Debug ${timestamp}]`, ...args);
     }
   }
 
-  private findClientById(responseId: string | number): WebSocket | null {
-    for (const [client, state] of this.clients.entries()) {
-      if (state.activeRequests.has(responseId)) {
-        return client;
-      }
-    }
-    // Special case for stream final chunk (original request ID might be removed)
-    // This needs a more robust way to map stream responses back to clients if needed
-    // For now, assume the last client that initiated the stream ID is the target
-    // This is NOT reliable if multiple clients stream simultaneously with the same ID logic.
-    // A better approach would be to store the WebSocket instance with the AbortController.
-    return null; // Needs improvement for robust stream handling
-  }
-
+  // --- Removed findClientById as logic moved into the 'response' event handler ---
 
   private handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     if (req.url === '/health' && req.method === 'GET') {
@@ -102,7 +122,6 @@ export class MCPServer {
   }
 
   private handleConnection(ws: WebSocket, req: http.IncomingMessage): void {
-    // --- Fix for Error 1: Handle potential string array from x-forwarded-for ---
     let rawIp = req.socket.remoteAddress || req.headers['x-forwarded-for'] || 'unknown';
     let clientIp: string;
     if (Array.isArray(rawIp)) {
@@ -110,7 +129,6 @@ export class MCPServer {
     } else {
       clientIp = rawIp;
     }
-    // --- End Fix ---
     this.log(`New connection established from IP: ${clientIp}`);
 
     const state: ConnectionState = {
@@ -118,81 +136,131 @@ export class MCPServer {
       lastMessageAt: new Date(),
       initialized: false,
       activeRequests: new Set(),
-      ip: clientIp // Now guaranteed to be a string
+      ip: clientIp
     };
     this.clients.set(ws, state);
 
     ws.on('message', async (data: WebSocket.RawData, isBinary: boolean) => {
-      state.lastMessageAt = new Date(); // Update timestamp on any message
+      state.lastMessageAt = new Date();
       if (isBinary) {
         this.log(`Received binary data from ${state.ip}, ignoring.`);
-        // Optionally send an error if binary is unexpected
-        // this.sendError(ws, null, ERROR_CODES.INVALID_REQUEST, "Binary messages not supported");
         return;
       }
 
       const message = data.toString();
-      let request: MCPRequest | null = null; // Initialize request as null
+      let request: MCPRequest | null = null;
 
       try {
         request = JSON.parse(message);
-        this.log(`Received request from ${state.ip}:`, JSON.stringify(request)); // Log parsed request
-
-        // Basic validation
-        if (!request || typeof request !== 'object' || request.jsonrpc !== '2.0' || !request.method || !request.id) {
-          throw this.createError(ERROR_CODES.INVALID_REQUEST, 'Invalid MCP request structure');
+        // Avoid logging potentially large params in production/non-debug
+        if (this.debug) {
+          this.log(`Received request from ${state.ip}:`, JSON.stringify(request));
+        } else if (request) {
+          this.log(`Received request from ${state.ip}: Method=${request.method}, ID=${request.id}`);
         }
 
-        this.protocol.validateState(request.method); // Check if initialized, etc.
+
+        if (!request || typeof request !== 'object' || request.jsonrpc !== '2.0') {
+          throw this.createError(ERROR_CODES.INVALID_REQUEST, 'Invalid JSON-RPC structure');
+        }
+        if (typeof request.method !== 'string') {
+          throw this.createError(ERROR_CODES.INVALID_REQUEST, 'Invalid method (must be string)');
+        }
+        if (!('id' in request)) { // Notifications don't have ID, but requests do
+          // Handle notifications if necessary, otherwise ignore/error
+          if (request.method === 'exit') {
+            this.log(`Received exit notification from ${state.ip}. Closing connection.`);
+            ws.close();
+            return; // Stop processing this message
+          } else {
+            this.log(`Received notification without ID from ${state.ip}: ${request.method}. Ignoring.`);
+            return; // Stop processing this message
+          }
+        }
+        if (typeof request.id !== 'string' && typeof request.id !== 'number') {
+          throw this.createError(ERROR_CODES.INVALID_REQUEST, 'Invalid request ID (must be string or number)');
+        }
+
+
+        this.protocol.validateState(request.method);
 
         if (request.method === 'initialize') {
-          state.initialized = true; // Mark client as initialized
+          // Ensure initialize is only called once per connection
+          if (state.initialized) {
+            throw this.createError(ERROR_CODES.INVALID_REQUEST, 'Server already initialized for this connection');
+          }
+          state.initialized = true;
+          this.log(`Client ${state.ip} initialized.`);
+        } else if (!state.initialized && request.method !== 'shutdown' && request.method !== 'exit') {
+          // Allow shutdown/exit even if not initialized, reject others
+          throw this.createError(ERROR_CODES.SERVER_NOT_INITIALIZED, 'Server not initialized');
         }
+
 
         state.activeRequests.add(request.id); // Track active request ID
 
-        // Handle request using the handler class
         const response = await this.handlers.handleRequest(request);
 
-        // If response is null, it means it's a stream handled by events
+        // If response is NOT null (i.e., not a stream start), send it back
         if (response) {
           this.sendMessage(ws, response);
+          // Request is complete, remove ID for non-streaming requests
+          state.activeRequests.delete(request.id);
+          this.log(`Removed completed request ID ${request.id} for client ${state.ip}`);
+        } else {
+          // Stream started, ID remains in activeRequests until final chunk event
+          this.log(`Stream started for request ID ${request.id} for client ${state.ip}`);
         }
 
       } catch (error) {
         // Handle errors thrown during validation or request handling
-        this.handleError(ws, request?.id ?? null, error); // Pass ID if available
-      } finally {
-        // Remove request ID only if it was successfully added
-        if (request?.id) {
+        this.handleError(ws, request?.id ?? null, error);
+        // Ensure request ID is removed even if handling failed
+        if (request?.id && state.activeRequests.has(request.id)) {
           state.activeRequests.delete(request.id);
+          this.log(`Removed failed request ID ${request.id} for client ${state.ip}`);
         }
       }
+      // --- Removed finally block as ID removal is now handled based on response type ---
     });
 
     ws.on('error', (error: Error) => {
       console.error(`WebSocket error from ${state.ip}:`, error.message);
       this.logError('connection', error, state);
-      this.clients.delete(ws); // Clean up on error
+      this.cleanUpClient(ws, state); // Use cleanup function
     });
 
     ws.on('close', (code: number, reason: Buffer) => {
       this.log(`Connection closed from ${state.ip}. Code: ${code}, Reason: ${reason.toString()}`);
-      // Cancel any pending requests for this client
-      state.activeRequests.forEach((requestId: string | number) => { // Added type
-        this.handlers.cancelRequest(requestId);
-      });
-      this.clients.delete(ws); // Clean up state
+      this.cleanUpClient(ws, state); // Use cleanup function
     });
 
     ws.on('pong', () => {
-      state.lastMessageAt = new Date(); // Consider pong as activity
+      state.lastMessageAt = new Date();
       this.log(`Received pong from ${state.ip}`);
     });
-
-    // Optionally send a connection established notification (non-standard MCP)
-    // this.sendMessage(ws, { jsonrpc: '2.0', method: 'server/connected', params: { serverId: 'gemini-mcp-...' } });
   }
+
+  // Helper function to clean up client state and cancel requests
+  private cleanUpClient(ws: WebSocket, state: ConnectionState | undefined): void {
+    if (!state) {
+      // Find state if not passed directly (e.g., from error handler)
+      state = this.clients.get(ws);
+    }
+    if (state) {
+      this.log(`Cleaning up client state for ${state.ip}`);
+      // Cancel any pending requests for this client
+      state.activeRequests.forEach((requestId: string | number) => {
+        this.log(`Cancelling request ${requestId} for disconnected client ${state?.ip}`);
+        this.handlers.cancelRequest(requestId);
+      });
+      this.clients.delete(ws); // Clean up state map
+      this.log(`Client ${state.ip} removed. Total clients: ${this.clients.size}`);
+    } else {
+      this.log(`Attempted to clean up client, but state not found.`);
+    }
+  }
+
 
   private handleError(ws: WebSocket, requestId: string | number | null, error: any): void {
     const state = this.clients.get(ws);
@@ -200,6 +268,7 @@ export class MCPServer {
 
     let code = ERROR_CODES.INTERNAL_ERROR;
     let message = 'Internal server error';
+    let data: any = undefined;
 
     if (error && typeof error === 'object') {
       if ('code' in error && typeof error.code === 'number') {
@@ -208,36 +277,53 @@ export class MCPServer {
       if ('message' in error && typeof error.message === 'string') {
         message = error.message;
       }
+      if ('data' in error) {
+        data = error.data; // Include data if present in the error object
+      }
+      // Add specific check for Gemini API errors if not already structured
+      if (message.startsWith('Gemini API Error:') && code === ERROR_CODES.INTERNAL_ERROR) {
+        code = ERROR_CODES.GEMINI_API_ERROR; // Use a more specific code if possible
+      }
+
     } else if (typeof error === 'string') {
-      message = error; // Use string directly if error is just a string
+      message = error;
+    } else {
+      // Ensure we log the original error structure if it wasn't parsed
+      console.error("Unhandled error type:", error);
     }
 
-    // Ensure we have a valid ID (use 0 or null if parsing failed early)
-    const finalId = requestId ?? null;
-    this.sendError(ws, finalId, code, message);
+
+    // Use null for id if the request ID was invalid or parsing failed early
+    const finalId = (typeof requestId === 'string' || typeof requestId === 'number') ? requestId : null;
+    this.sendError(ws, finalId, code, message, data);
   }
 
   private handleServerError(error: Error): void {
     console.error('WebSocket Server Error:', error);
     this.logError('server', error);
-    // Consider attempting to restart or log critical failure
   }
 
   private sendMessage(ws: WebSocket, message: MCPResponse | NotificationMessage): void {
     if (ws.readyState === WebSocket.OPEN) {
       const payload = JSON.stringify(message);
-      this.log(`Sending message to ${this.clients.get(ws)?.ip}:`, payload);
+      if (this.debug) {
+        this.log(`Sending message to ${this.clients.get(ws)?.ip}:`, payload);
+      } else {
+        this.log(`Sending message to ${this.clients.get(ws)?.ip}: Method=${message.method || 'response'}, ID=${(message as MCPResponse).id ?? 'N/A'}`);
+      }
       ws.send(payload);
     } else {
       this.log(`Attempted to send message to closed socket for IP: ${this.clients.get(ws)?.ip}`);
     }
   }
 
-  private sendError(ws: WebSocket, id: string | number | null, code: number, message: string): void {
+  private sendError(ws: WebSocket, id: string | number | null, code: number, message: string, data?: any): void {
+    // According to JSON-RPC 2.0 spec, id MUST be included in error responses
+    // if it was present in the request. Use null if request id was invalid/missing.
     const errorResponse: MCPResponse = {
       jsonrpc: '2.0',
-      id: id ?? 0, // Use 0 if ID is null (e.g., parse error before ID is known)
-      error: { code, message }
+      id: id, // Use null if id wasn't available or valid
+      error: { code, message, data } // Include data if provided
     };
     this.sendMessage(ws, errorResponse);
   }
@@ -246,12 +332,20 @@ export class MCPServer {
     const now = Date.now();
     this.log(`Monitoring ${this.clients.size} connections...`);
     this.clients.forEach((state, ws) => {
-      // Check for stale connections (no message or pong in 5 minutes)
       const timeSinceLastActivity = (now - state.lastMessageAt.getTime());
+
+      // Check readiness state before terminating or pinging
+      if (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
+        this.log(`Client ${state.ip} is already closing/closed. Removing.`);
+        this.cleanUpClient(ws, state); // Ensure cleanup if missed
+        return;
+      }
+
+      // Terminate stale connections (e.g., no message/pong for 5 minutes)
       if (timeSinceLastActivity > 5 * 60 * 1000) { // 5 minutes
-        this.log(`Closing stale connection from ${state.ip} (no activity for ${Math.round(timeSinceLastActivity / 1000)}s)`);
+        this.log(`Terminating stale connection from ${state.ip} (no activity for ${Math.round(timeSinceLastActivity / 1000)}s)`);
         ws.terminate(); // Force close unresponsive connection
-        this.clients.delete(ws); // Clean up immediately
+        // No need to call cleanUpClient here, the 'close' event will handle it
       } else if (ws.readyState === WebSocket.OPEN) {
         // Send ping to keep connection alive and check responsiveness
         this.log(`Pinging client ${state.ip}`);
@@ -260,39 +354,62 @@ export class MCPServer {
     });
   }
 
-  private logError(type: string, error: Error, state?: ConnectionState): void {
+  private logError(type: string, error: any, state?: ConnectionState): void {
+    // Improved error logging
+    let errorDetails: any = {};
+    if (error instanceof Error) {
+      errorDetails = {
+        name: error.name,
+        message: error.message,
+        stack: this.debug ? error.stack : undefined, // Only include stack in debug mode
+        code: (error as any).code, // Include code if present
+        data: (error as any).data // Include data if present
+      };
+    } else if (typeof error === 'object' && error !== null) {
+      errorDetails = { ...error }; // Log the object structure
+      if (!this.debug) delete errorDetails.stack; // Remove stack if not debugging
+    }
+    else {
+      errorDetails = { message: String(error) }; // Convert non-objects to string
+    }
+
+
     const errorLog = {
       timestamp: new Date().toISOString(),
       type, // 'connection', 'request', 'server'
-      error: {
-        name: error.name,
-        message: error.message,
-        stack: this.debug ? error.stack : undefined // Only include stack in debug mode
-      },
+      error: errorDetails,
       connectionInfo: state ? {
         ip: state.ip,
         connectedAt: state.connectedAt.toISOString(),
         lastMessageAt: state.lastMessageAt.toISOString(),
         initialized: state.initialized,
-        activeRequestCount: state.activeRequests.size
+        activeRequestCount: state.activeRequests.size,
+        activeRequestIds: this.debug ? Array.from(state.activeRequests) : undefined
       } : undefined
     };
-    // Log as structured JSON for easier parsing
+    // Log as structured JSON to stderr for easier parsing by logging systems
     console.error("MCP_ERROR:", JSON.stringify(errorLog));
   }
 
+
   broadcast(notification: NotificationMessage): void {
     this.log('Broadcasting notification:', notification.method);
+    const payload = JSON.stringify(notification);
     this.clients.forEach((state, client) => {
-      this.sendMessage(client, notification);
+      if (client.readyState === WebSocket.OPEN) {
+        this.log(`Broadcasting to ${state.ip}`);
+        client.send(payload);
+      } else {
+        this.log(`Skipping broadcast to ${state.ip} (socket not open)`);
+      }
     });
   }
 
   async shutdown(signal: string): Promise<void> {
-    console.log(`Received ${signal}. Shutting down MCP server gracefully...`);
+    console.error(`Received ${signal}. Shutting down MCP server gracefully...`); // Log shutdown to stderr
     this.protocol.requestShutdown();
 
-    // Notify clients
+    // Notify clients (best effort)
     this.broadcast({
       jsonrpc: '2.0',
       method: 'server/shutdown', // Custom notification
@@ -301,49 +418,66 @@ export class MCPServer {
 
     // Close connections and cancel requests
     const closePromises: Promise<void>[] = [];
+    this.log(`Closing ${this.clients.size} client connections...`);
     this.clients.forEach((state, client) => {
-      state.activeRequests.forEach((requestId: string | number) => { // Added type
+      // Cancel active requests before closing
+      state.activeRequests.forEach((requestId: string | number) => {
+        this.log(`Cancelling request ${requestId} during shutdown for client ${state.ip}`);
         this.handlers.cancelRequest(requestId);
       });
+
       closePromises.push(new Promise(resolve => {
-        client.on('close', resolve);
-        client.close(1001, 'Server shutting down');
-        // Set a timeout in case close event doesn't fire
-        setTimeout(() => {
-          client.terminate();
-          resolve();
-        }, 2000); // 2 second timeout
+        if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) {
+          client.once('close', () => {
+            this.log(`Client ${state.ip} connection closed.`);
+            resolve();
+          });
+          client.close(1001, 'Server shutting down');
+          // Set a timeout in case close event doesn't fire promptly
+          setTimeout(() => {
+            if (client.readyState !== WebSocket.CLOSED) {
+              this.log(`Forcibly terminating connection for ${state.ip} after timeout.`);
+              client.terminate();
+            }
+            resolve(); // Resolve even if terminate was needed
+          }, 2000); // 2 second timeout
+        } else {
+          this.log(`Client ${state.ip} already closing/closed.`);
+          resolve(); // Already closed or closing
+        }
       }));
     });
 
     try {
       await Promise.all(closePromises);
-      this.log('All client connections closed.');
+      this.log('All client connections handled.');
     } catch (e) {
       this.log('Error during client connection closing:', e);
+    } finally {
+      this.clients.clear(); // Ensure map is cleared
     }
 
 
     // Close servers
+    this.log("Closing WebSocket server...");
     await new Promise<void>(resolve => this.wss.close(err => {
       if (err) console.error("Error closing WebSocket server:", err);
       else this.log("WebSocket server closed.");
       resolve();
     }));
+
+    this.log("Closing HTTP server...");
     await new Promise<void>(resolve => this.httpServer.close(err => {
       if (err) console.error("Error closing HTTP server:", err);
       else this.log("HTTP server closed.");
       resolve();
     }));
 
-    console.log('MCP server shut down complete.');
+    console.error('MCP server shut down complete.'); // Log completion to stderr
     process.exit(0);
   }
 
-  // Helper to create structured MCPError objects
-  // --- Fix for Error 2: Added MCPError return type annotation ---
   private createError(code: number, message: string, data?: any): MCPError {
     return { code, message, data };
   }
-  // --- End Fix ---
 }
